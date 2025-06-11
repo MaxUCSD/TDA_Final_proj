@@ -1,0 +1,1586 @@
+TDA Project Code Dump
+Generated: 2025-06-10 18:48:19
+
+File: AFL_utils.py
+Location: src/AFL_utils.py
+Size: 4817 bytes
+Last Modified: 2025-06-10 18:39:16
+--------------------------------------------------
+
+import subprocess
+import os
+import tempfile
+
+class AFL_Utils:
+    """Utilities for working with AFL (American Fuzzy Lop) execution traces.
+    
+    This class provides methods for running AFL's showmap tool and parsing its output
+    to extract execution traces from programs. It handles the interaction with AFL
+    and provides convenient access to trace data.
+    
+    Attributes:
+        target_program (str): Path to the program being analyzed
+        trace_text (str): Raw output from AFL showmap
+        trace_edges (list): List of edge IDs from the trace
+        trace_nodes (list): List of unique node IDs from the trace
+    """
+    
+    def __init__(self, target_program: str):
+        """Initializes a new AFL_Utils instance.
+        
+        Args:
+            target_program (str): Path to the program to analyze with AFL
+        """
+        self.target_program = target_program
+        self.trace_text = None
+        self.trace_edges = None
+        self.trace_nodes = None
+        
+    def __str__(self):
+        """Returns a string representation of the AFL_Utils instance.
+        
+        Returns:
+            str: Formatted string showing program path and trace information
+        """
+        status = []
+        status.append(f"AFL_Utils for program: {self.target_program}")
+        if self.trace_edges is not None:
+            status.append(f"Last trace edges: {self.trace_edges}")
+            status.append(f"Last trace nodes: {self.trace_nodes}")
+            status.append(f"Trace length: {len(self.trace_edges)}")
+        else:
+            status.append("No trace data collected yet")
+        return "\n".join(status)
+        
+    def run_showmap(self, input_file_path: str):
+        """Runs AFL showmap on the target program with the given input.
+        
+        This method:
+        1. Runs AFL showmap to collect edge coverage
+        2. Parses the output to extract edge IDs
+        3. Extracts unique node IDs from the edges
+        
+        Args:
+            input_file_path (str): Path to the input file to use
+            
+        Returns:
+            tuple: (list of edge IDs, list of node IDs)
+        """
+        self.trace_text = self._run_showmap(input_file_path)
+        self.trace_edges = self._parse_afl_trace()
+        self.trace_nodes = self._get_nodes_from_edges(self.trace_edges)
+        print(f"{input_file_path} parsed edge IDs: {self.trace_edges}")
+        return self.trace_edges, self.trace_nodes
+    
+    def _run_showmap(self, input_file_path: str):
+        """Runs AFL showmap and captures its output.
+        
+        This method:
+        1. Creates a temporary file for AFL output
+        2. Runs AFL showmap with the given input
+        3. Reads and returns the output
+        
+        Args:
+            input_file_path (str): Path to the input file
+            
+        Returns:
+            str: Raw output from AFL showmap, or None if execution failed
+        """
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            output_file = tmp.name
+        with open(input_file_path, 'r') as f:
+            input_value = f.read().strip()
+        cmd = ['afl-showmap','-o', output_file,'-C','--',self.target_program,input_value]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            with open(output_file, 'r') as f:
+                trace_text = f.read()
+            os.remove(output_file)
+            return trace_text
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            return None
+
+    def _parse_afl_trace(self):
+        """Parses the AFL trace text into a list of edge IDs.
+        
+        This method processes the raw AFL output format:
+        - Each line contains an edge ID and count (e.g., "5:1")
+        - Only the edge IDs are extracted
+        
+        Returns:
+            list: A list of integer edge IDs from the trace, or empty list if no trace
+        """
+        if not self.trace_text: return []
+        edge_ids = []
+        for line in self.trace_text.strip().split('\n'):
+            if ':' not in line: continue
+            edge_id, count = line.strip().split(':')
+            edge_ids.append(int(edge_id))
+        return edge_ids
+
+    def _get_nodes_from_edges(self, edges):
+        """Extracts unique node IDs from a list of edges.
+        
+        This method:
+        1. Takes a list of edge IDs
+        2. Extracts all unique node IDs
+        3. Returns them in sorted order
+        
+        Args:
+            edges (list): List of edge IDs from the trace
+            
+        Returns:
+            list: Sorted list of unique node IDs present in the edges
+        """
+        if not edges: return []
+        return sorted(set(edges))
+--------------------------------------------------
+
+File: analysis.py
+Location: src/analysis.py
+Size: 23946 bytes
+Last Modified: 2025-06-10 18:39:44
+--------------------------------------------------
+
+import networkx as nx
+import numpy as np
+import dionysus as d
+import matplotlib.pyplot as plt
+from graph_utils import trace_to_graph, get_graph_stats
+from AFL_utils import AFL_Utils
+import os
+
+class TDAnalyzer:
+    """Analyzes program execution traces using Topological Data Analysis (TDA).
+    
+    This class implements zigzag persistence homology to analyze the topological
+    structure of program execution traces. It computes persistent homology features
+    (H0 and H1) to identify connected components and cycles in the execution flow.
+    
+    Attributes:
+        G (nx.DiGraph): The graph representation of the trace
+        root (int): The root node of the trace
+        distance_from_root (dict): Mapping of nodes to their distance from root
+        filtration (d.Filtration): The simplicial filtration for persistence
+        zigzag (d.ZigzagPersistence): The zigzag persistence computation
+        diagrams (list): The persistence diagrams (H0, H1)
+        cells (list): The persistence cells
+    """
+
+    def __init__(self):
+        """Initializes a new TDAnalyzer instance with empty attributes."""
+        self.G = None
+        self.root = None
+        self.distance_from_root = None
+        self.filtration = None
+        self.zigzag = None
+        self.diagrams = None
+        self.cells = None
+
+    def analyze_trace(self, trace):
+        """Analyzes a given trace using TDA.
+        
+        This method:
+        1. Converts the trace to a graph
+        2. Computes distances from root
+        3. Builds a simplicial filtration
+        4. Computes zigzag persistent homology
+        
+        Args:
+            trace (list): List of integers representing the execution trace
+        """
+        self.G = trace_to_graph(trace)
+        self.root = trace[0]
+        self.distance_from_root = nx.shortest_path_length(self.G, source=self.root)
+
+        # Print distances from root
+        print("\n--- Node Distances from Root ---")
+        for node, dist in sorted(self.distance_from_root.items()):
+            print(f"  Node {node}: distance = {dist}")
+
+        # Build and check filtration
+        self._build_filtration()
+        print("\nChecking if filtration is a valid simplicial complex...")
+        d.is_simplicial(self.filtration, report=True)
+        print("Check complete.")
+
+        # Compute birth times and zigzag persistence
+        times = self._compute_birth_times()
+        print("\nComputing zigzag persistent homology...")
+        self.zigzag, self.diagrams, self.cells = d.zigzag_homology_persistence(self.filtration, times)
+
+        # Print H0 diagram points
+        print("\n--- H0 Diagram Points (Birth, Death) ---")
+        if len(self.diagrams) > 0 and self.diagrams[0]:
+            h0_diagram = self.diagrams[0]
+            for pt in h0_diagram:
+                print(f"  ({pt.birth}, {pt.death})")
+        else:
+            print("  No H0 features found in the trace")
+
+        # Print H1 diagram points
+        print("\n--- H1 Diagram Points (Birth, Death) ---")
+        if len(self.diagrams) > 1 and self.diagrams[1]:
+            h1_diagram = self.diagrams[1]
+            for pt in h1_diagram:
+                print(f"  ({pt.birth}, {pt.death})")
+        else:
+            print("  No H1 features found in the trace (no cycles detected)")
+
+    def analyze_afl_trace(self, afl_utils: AFL_Utils, input_file_path: str):
+        """Analyzes a trace from AFL showmap output.
+        
+        Args:
+            afl_utils (AFL_Utils): AFL utilities instance
+            input_file_path (str): Path to the input file to analyze
+        """
+        edges, nodes = afl_utils.run_showmap(input_file_path)
+        if not edges:
+            print("No trace data available")
+            return
+        
+        # Convert AFL edge IDs to a trace
+        trace = edges
+        self.analyze_trace(trace)
+
+    def _build_filtration(self):
+        """Builds the simplicial filtration from the graph.
+        
+        Creates 0-simplices (nodes) and 1-simplices (edges) for the filtration.
+        """
+        all_simplices = []
+        for node in self.G.nodes():
+            all_simplices.append(d.Simplex([int(node)]))
+        for u, v in self.G.edges():
+            all_simplices.append(d.Simplex([int(u), int(v)]))
+        self.filtration = d.Filtration(all_simplices)
+
+    def _compute_birth_times(self):
+        """Computes birth times for the filtration.
+        
+        Birth times are based on the distance from root for each simplex.
+        
+        Returns:
+            list: List of birth times for each simplex in the filtration
+        """
+        times = []
+        for s in self.filtration:
+            if len(s) == 1:
+                node = s[0]
+                birth_time = self.distance_from_root[node]
+            elif len(s) == 2:
+                u, v = s[0], s[1]
+                birth_time = max(self.distance_from_root[u], self.distance_from_root[v])
+            times.append([birth_time])
+        return times
+
+    def get_graph_stats(self):
+        """Returns statistics about the analyzed graph.
+        
+        Returns:
+            dict: Dictionary containing graph statistics
+            
+        Raises:
+            ValueError: If analyze_trace() or analyze_afl_trace() hasn't been called
+        """
+        if not self.G:
+            raise ValueError("Must run analyze_trace() or analyze_afl_trace() before getting stats")
+        return get_graph_stats(self.G)
+
+class GlobalCFGAnalyzer:
+    """Analyzes the global Control Flow Graph (CFG) from multiple execution traces.
+    
+    This class builds and analyzes a global CFG that combines information from
+    multiple execution traces, identifying common paths, branch points, and
+    convergence points.
+    
+    Attributes:
+        global_cfg (nx.DiGraph): The global control flow graph
+        all_traces (list): List of all execution traces
+        trace_metadata (dict): Mapping of input names to their traces
+    """
+    
+    def __init__(self):
+        """Initializes a new GlobalCFGAnalyzer instance with empty attributes."""
+        self.global_cfg = None
+        self.all_traces = []
+        self.trace_metadata = {}
+        
+    def add_trace(self, trace, input_name):
+        """Adds a trace to the global CFG.
+        
+        Args:
+            trace (list): The execution trace to add
+            input_name (str): Name/identifier for this trace
+        """
+        self.all_traces.append(trace)
+        self.trace_metadata[input_name] = trace
+        
+    def build_global_cfg(self):
+        """Builds the global control flow graph from all traces.
+        
+        Creates a directed graph where edges are weighted by their frequency
+        across all traces.
+        
+        Returns:
+            nx.DiGraph: The constructed global CFG
+        """
+        import networkx as nx
+        
+        self.global_cfg = nx.DiGraph()
+        
+        # Add all edges from all traces
+        for trace in self.all_traces:
+            for i in range(len(trace) - 1):
+                edge = (trace[i], trace[i+1])
+                
+                # Add edge and track frequency
+                if self.global_cfg.has_edge(trace[i], trace[i+1]):
+                    self.global_cfg[trace[i]][trace[i+1]]['frequency'] += 1
+                else:
+                    self.global_cfg.add_edge(trace[i], trace[i+1], frequency=1)
+        
+        return self.global_cfg
+    
+    def analyze_global_topology(self):
+        """Analyzes the topology of the global CFG.
+        
+        Computes and prints:
+        - Node and edge counts
+        - Distances from root
+        - Node degrees
+        - Edge frequencies
+        
+        Returns:
+            dict: Mapping of nodes to their distances from root
+        """
+        if not self.global_cfg:
+            self.build_global_cfg()
+            
+        # Compute distances from root (first node of first trace)
+        root = self.all_traces[0][0] if self.all_traces else None
+        if not root:
+            return None
+            
+        distances = nx.shortest_path_length(self.global_cfg, source=root)
+        
+        print("\n=== GLOBAL CFG ANALYSIS ===")
+        print(f"Total nodes: {self.global_cfg.number_of_nodes()}")
+        print(f"Total edges: {self.global_cfg.number_of_edges()}")
+        print(f"Root node: {root}")
+        
+        print("\nNode distances from root:")
+        for node, dist in sorted(distances.items()):
+            out_degree = self.global_cfg.out_degree(node)
+            in_degree = self.global_cfg.in_degree(node)
+            print(f"  Node {node}: distance={dist}, in_degree={in_degree}, out_degree={out_degree}")
+            
+        print("\nEdge frequencies:")
+        for u, v, data in self.global_cfg.edges(data=True):
+            print(f"  {u} → {v}: frequency={data['frequency']}")
+            
+        return distances
+    
+    def analyze_global_persistence(self):
+        """Computes persistent homology on the global CFG.
+        
+        Creates a filtration based on distance from root and computes
+        persistent homology features (H0 and H1).
+        
+        Returns:
+            list: Persistence diagrams for H0 and H1
+        """
+        import dionysus as d
+        
+        if not self.global_cfg:
+            self.build_global_cfg()
+            
+        # Get root and distances
+        root = self.all_traces[0][0]
+        distances = nx.shortest_path_length(self.global_cfg, source=root)
+        
+        print("\n=== GLOBAL CFG PERSISTENT HOMOLOGY ===")
+        
+        # Build filtration based on distance from root
+        simplices = []
+        
+        # Add nodes (0-simplices)
+        for node in self.global_cfg.nodes():
+            simplex = d.Simplex([int(node)])
+            simplices.append((distances[node], simplex))
+        
+        # Add edges (1-simplices)  
+        for u, v in self.global_cfg.edges():
+            simplex = d.Simplex([int(u), int(v)])
+            birth_time = max(distances[u], distances[v])
+            simplices.append((birth_time, simplex))
+        
+        # Sort by filtration time
+        simplices.sort(key=lambda x: x[0])
+        
+        # Create filtration
+        filtration = d.Filtration([s[1] for s in simplices])
+        
+        # Compute persistence
+        persistence = d.homology_persistence(filtration)
+        diagrams = d.init_diagrams(persistence, filtration)
+        
+        # Print results
+        print(f"H0 (Connected Components) - {len(diagrams[0])} features:")
+        for i, pt in enumerate(diagrams[0]):
+            print(f"  Feature {i}: birth={pt.birth}, death={pt.death}")
+            
+        if len(diagrams) > 1:
+            print(f"H1 (Cycles) - {len(diagrams[1])} features:")
+            for i, pt in enumerate(diagrams[1]):
+                print(f"  Feature {i}: birth={pt.birth}, death={pt.death}")
+        else:
+            print("H1 (Cycles) - 0 features")
+            
+        return diagrams
+    
+    def analyze_execution_in_global_context(self, execution_trace, input_name):
+        """Analyzes how a specific execution interacts with global topology.
+        
+        Computes:
+        - Execution subgraph
+        - Node distances in execution vs global context
+        - Branch points and convergence points
+        
+        Args:
+            execution_trace (list): The execution trace to analyze
+            input_name (str): Name/identifier for this execution
+            
+        Returns:
+            dict: Analysis results including subgraph, distances, and key points
+        """
+        if not self.global_cfg:
+            self.build_global_cfg()
+            
+        print(f"\n=== EXECUTION ANALYSIS: {input_name} ===")
+        print(f"Trace: {execution_trace}")
+        
+        # Extract subgraph for this execution
+        execution_subgraph = self.global_cfg.subgraph(execution_trace)
+        
+        print(f"Execution subgraph: {execution_subgraph.number_of_nodes()} nodes, {execution_subgraph.number_of_edges()} edges")
+        
+        # Compute distances in execution subgraph
+        root = execution_trace[0]
+        exec_distances = nx.shortest_path_length(execution_subgraph, source=root)
+        
+        print("Node distances in execution:")
+        for node in execution_trace:
+            global_dist = nx.shortest_path_length(self.global_cfg, source=root)[node]
+            exec_dist = exec_distances[node]
+            print(f"  Node {node}: global_distance={global_dist}, execution_distance={exec_dist}")
+        
+        # Which branch points does this execution hit?
+        branch_points = []
+        for node in execution_trace:
+            if self.global_cfg.out_degree(node) > 1:
+                branch_points.append(node)
+        print(f"Branch points traversed: {branch_points}")
+        
+        # Which convergence points does this execution hit?
+        convergence_points = []
+        for node in execution_trace:
+            if self.global_cfg.in_degree(node) > 1:
+                convergence_points.append(node)
+        print(f"Convergence points traversed: {convergence_points}")
+        
+        return {
+            'subgraph': execution_subgraph,
+            'distances': exec_distances,
+            'branch_points': branch_points,
+            'convergence_points': convergence_points
+        }
+
+class HybridTDAAnalyzer:
+    """Combines zigzag persistence and global CFG analysis for comprehensive program analysis.
+    
+    This class implements a hybrid approach that combines:
+    1. Local topology analysis using zigzag persistence
+    2. Global structure analysis using CFG
+    3. Execution clustering based on hybrid signatures
+    
+    Attributes:
+        individual_analyzer (TDAnalyzer): For individual trace analysis
+        global_analyzer (GlobalCFGAnalyzer): For global CFG analysis
+        hybrid_signatures (dict): Combined signatures for each execution
+    """
+    
+    def __init__(self):
+        """Initializes a new HybridTDAAnalyzer instance."""
+        self.individual_analyzer = TDAnalyzer()
+        self.global_analyzer = GlobalCFGAnalyzer()
+        self.hybrid_signatures = {}
+        
+    def analyze_execution_hybrid(self, trace, input_name):
+        """Performs hybrid analysis on a single execution trace.
+        
+        Combines:
+        1. Individual zigzag analysis for local topology
+        2. Global CFG analysis for structural patterns
+        
+        Args:
+            trace (list): The execution trace to analyze
+            input_name (str): Name/identifier for this execution
+            
+        Returns:
+            dict: Local topological signature
+        """
+        print(f"\n{'='*50}")
+        print(f"HYBRID ANALYSIS: {input_name}")
+        print(f"{'='*50}")
+        
+        # 1. Individual zigzag analysis (local topology)
+        print("\n--- INDIVIDUAL TRACE ANALYSIS (Zigzag) ---")
+        self.individual_analyzer.analyze_trace(trace)
+        local_signature = self._extract_local_signature()
+        
+        # 2. Add to global CFG for later global analysis
+        self.global_analyzer.add_trace(trace, input_name)
+        
+        # 3. Store individual results
+        self.hybrid_signatures[input_name] = {
+            'trace': trace,
+            'local_signature': local_signature,
+            'global_signature': None  # Will be filled after global analysis
+        }
+        
+        return local_signature
+    
+    def complete_global_analysis(self):
+        """Completes the global analysis and combines with individual results.
+        
+        This method:
+        1. Builds and analyzes the global CFG
+        2. Computes global persistence
+        3. Analyzes each execution in global context
+        4. Combines local and global signatures
+        
+        Returns:
+            list: Global persistence diagrams
+        """
+        print(f"\n{'='*50}")
+        print("GLOBAL CFG ANALYSIS")
+        print(f"{'='*50}")
+        
+        # Build and analyze global CFG
+        self.global_analyzer.build_global_cfg()
+        self.global_analyzer.analyze_global_topology()
+        global_diagrams = self.global_analyzer.analyze_global_persistence()
+        
+        # Analyze each execution in global context
+        for input_name, trace in self.global_analyzer.trace_metadata.items():
+            global_context = self.global_analyzer.analyze_execution_in_global_context(trace, input_name)
+            global_signature = self._extract_global_signature(global_context)
+            
+            # Combine with local signature
+            if input_name in self.hybrid_signatures:
+                self.hybrid_signatures[input_name]['global_signature'] = global_signature
+                self.hybrid_signatures[input_name]['combined_signature'] = self._combine_signatures(
+                    self.hybrid_signatures[input_name]['local_signature'],
+                    global_signature
+                )
+        
+        return global_diagrams
+    
+    def _extract_local_signature(self):
+        """Extracts topological signature from individual zigzag analysis.
+        
+        Returns:
+            dict: Local signature containing H0/H1 features and cycle information
+        """
+        local_sig = {
+            'h0_features': 0,
+            'h1_features': 0,
+            'has_cycles': False,
+            'cycle_birth_times': [],
+            'cycle_lifespans': [],
+            'path_length': 0
+        }
+        
+        if self.individual_analyzer.diagrams:
+            # H0 features
+            if len(self.individual_analyzer.diagrams) > 0:
+                local_sig['h0_features'] = len(self.individual_analyzer.diagrams[0])
+            
+            # H1 features (cycles)
+            if len(self.individual_analyzer.diagrams) > 1 and self.individual_analyzer.diagrams[1]:
+                h1_diagram = self.individual_analyzer.diagrams[1]
+                local_sig['h1_features'] = len(h1_diagram)
+                local_sig['has_cycles'] = len(h1_diagram) > 0
+                
+                for pt in h1_diagram:
+                    local_sig['cycle_birth_times'].append(pt.birth)
+                    if pt.death != float('inf'):
+                        local_sig['cycle_lifespans'].append(pt.death - pt.birth)
+        
+        if self.individual_analyzer.G:
+            local_sig['path_length'] = self.individual_analyzer.G.number_of_nodes()
+        
+        return local_sig
+    
+    def _extract_global_signature(self, global_context):
+        """Extracts topological signature from global CFG context.
+        
+        Args:
+            global_context (dict): Results from analyze_execution_in_global_context
+            
+        Returns:
+            dict: Global signature containing branch/convergence information
+        """
+        return {
+            'branch_points': global_context['branch_points'],
+            'convergence_points': global_context['convergence_points'],
+            'num_branch_points': len(global_context['branch_points']),
+            'num_convergence_points': len(global_context['convergence_points']),
+            'structural_complexity': len(global_context['branch_points']) + len(global_context['convergence_points'])
+        }
+    
+    def _combine_signatures(self, local_sig, global_sig):
+        """Combines local and global signatures into unified representation.
+        
+        Args:
+            local_sig (dict): Local topological signature
+            global_sig (dict): Global structural signature
+            
+        Returns:
+            dict: Combined signature with execution type classification
+        """
+        return {
+            # Local topology (from zigzag)
+            'local_cycles': local_sig['h1_features'],
+            'has_local_cycles': local_sig['has_cycles'],
+            'cycle_complexity': sum(local_sig['cycle_lifespans']) if local_sig['cycle_lifespans'] else 0,
+            
+            # Global topology (from CFG)
+            'global_branch_points': global_sig['num_branch_points'],
+            'global_convergence_points': global_sig['num_convergence_points'],
+            'structural_complexity': global_sig['structural_complexity'],
+            
+            # Combined features
+            'total_topological_complexity': (
+                local_sig['h1_features'] + global_sig['structural_complexity']
+            ),
+            'execution_type': self._classify_execution_type(local_sig, global_sig)
+        }
+    
+    def _classify_execution_type(self, local_sig, global_sig):
+        """Classifies execution based on combined topological features.
+        
+        Args:
+            local_sig (dict): Local topological signature
+            global_sig (dict): Global structural signature
+            
+        Returns:
+            str: Execution type classification
+        """
+        if local_sig['has_cycles'] and global_sig['structural_complexity'] > 2:
+            return "complex_looped"
+        elif local_sig['has_cycles']:
+            return "simple_looped"
+        elif global_sig['structural_complexity'] > 2:
+            return "complex_branched"
+        else:
+            return "simple_linear"
+    
+    def compute_hybrid_similarity(self, sig1, sig2):
+        """Computes similarity between two hybrid signatures.
+        
+        Similarity is computed as a weighted average of:
+        1. Local topology similarity (40%)
+        2. Global topology similarity (60%)
+        
+        Args:
+            sig1 (dict): First hybrid signature
+            sig2 (dict): Second hybrid signature
+            
+        Returns:
+            float: Similarity score between 0 and 1
+        """
+        # Local topology similarity
+        local_sim = 0
+        if sig1['has_local_cycles'] == sig2['has_local_cycles']:
+            local_sim += 0.5
+        if sig1['local_cycles'] == sig2['local_cycles']:
+            local_sim += 0.5
+        
+        # Global topology similarity
+        global_sim = 0
+        branch_sim = 1 - abs(sig1['global_branch_points'] - sig2['global_branch_points']) / max(
+            sig1['global_branch_points'] + sig2['global_branch_points'], 1
+        )
+        conv_sim = 1 - abs(sig1['global_convergence_points'] - sig2['global_convergence_points']) / max(
+            sig1['global_convergence_points'] + sig2['global_convergence_points'], 1
+        )
+        global_sim = (branch_sim + conv_sim) / 2
+        
+        # Combined similarity (weighted average)
+        return 0.4 * local_sim + 0.6 * global_sim
+    
+    def analyze_execution_clustering(self):
+        """Analyzes how executions cluster based on hybrid signatures.
+        
+        This method:
+        1. Prints individual signatures
+        2. Computes pairwise similarities
+        3. Prints similarity matrix
+        """
+        print(f"\n{'='*50}")
+        print("HYBRID SIGNATURE CLUSTERING ANALYSIS")
+        print(f"{'='*50}")
+        
+        # Print individual signatures
+        for input_name, data in self.hybrid_signatures.items():
+            if 'combined_signature' in data:
+                sig = data['combined_signature']
+                print(f"\n{input_name}:")
+                print(f"  Local cycles: {sig['local_cycles']}")
+                print(f"  Global branch points: {sig['global_branch_points']}")
+                print(f"  Global convergence points: {sig['global_convergence_points']}")
+                print(f"  Total complexity: {sig['total_topological_complexity']}")
+                print(f"  Execution type: {sig['execution_type']}")
+        
+        # Compute pairwise similarities
+        signatures = [(name, data['combined_signature']) for name, data in self.hybrid_signatures.items() 
+                     if 'combined_signature' in data]
+        
+        print(f"\nPairwise Hybrid Similarities:")
+        for i, (name1, sig1) in enumerate(signatures):
+            for j, (name2, sig2) in enumerate(signatures):
+                if i < j:
+                    similarity = self.compute_hybrid_similarity(sig1, sig2)
+                    print(f"  {name1} <-> {name2}: {similarity:.3f}") 
+--------------------------------------------------
+
+File: generate_code_dump.py
+Location: src/generate_code_dump.py
+Size: 2279 bytes
+Last Modified: 2025-06-09 17:20:50
+--------------------------------------------------
+
+#!/usr/bin/env python3
+
+import os
+import sys
+from datetime import datetime
+
+def get_file_info(file_path):
+    """Get information about a file including size and last modified time.
+    
+    Args:
+        file_path (str): Path to the file
+        
+    Returns:
+        tuple: (size in bytes, last modified time as string)
+    """
+    stats = os.stat(file_path)
+    size = stats.st_size
+    modified = datetime.fromtimestamp(stats.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    return size, modified
+
+def generate_code_dump():
+    """Generate a code_dump.txt file with information about all Python files in the project."""
+    # Get the project root directory (two levels up from this script)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    # Create the output file
+    output_path = os.path.join(project_root, 'code_dump.txt')
+    
+    with open(output_path, 'w') as f:
+        # Write header
+        f.write("TDA Project Code Dump\n")
+        f.write("Generated: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + "\n\n")
+        
+        # Walk through the src directory
+        src_dir = os.path.join(project_root, 'src')
+        for root, _, files in os.walk(src_dir):
+            for file in sorted(files):
+                if file.endswith('.py'):
+                    file_path = os.path.join(root, file)
+                    size, modified = get_file_info(file_path)
+                    
+                    # Write file information
+                    f.write(f"File: {file}\n")
+                    f.write(f"Location: {os.path.relpath(file_path, project_root)}\n")
+                    f.write(f"Size: {size} bytes\n")
+                    f.write(f"Last Modified: {modified}\n")
+                    f.write("-" * 50 + "\n\n")
+                    
+                    # Write file contents
+                    with open(file_path, 'r') as source_file:
+                        content = source_file.read()
+                        f.write(content)
+                        f.write("\n" + "-" * 50 + "\n\n")
+
+if __name__ == '__main__':
+    try:
+        generate_code_dump()
+        print("Successfully generated code_dump.txt")
+    except Exception as e:
+        print(f"Error generating code dump: {e}", file=sys.stderr)
+        sys.exit(1) 
+--------------------------------------------------
+
+File: graph_utils.py
+Location: src/graph_utils.py
+Size: 6779 bytes
+Last Modified: 2025-06-10 16:58:18
+--------------------------------------------------
+
+import networkx as nx
+from typing import List, Optional, Dict, Any
+import matplotlib.pyplot as plt
+import os
+
+def trace_to_graph(trace: List[int]) -> nx.DiGraph:
+    """Converts a trace into a NetworkX directed graph.
+    
+    This function creates a directed graph where:
+    - Nodes represent program locations
+    - Edges represent transitions between locations
+    - The graph preserves the sequential order of the trace
+    
+    Args:
+        trace: List of integers representing the sequence of nodes in the trace
+        
+    Returns:
+        A NetworkX directed graph where edges represent transitions between nodes
+    """
+    G = nx.DiGraph()
+    if not trace:
+        return G
+    
+    # Add all nodes first to ensure they exist
+    for node in trace:
+        G.add_node(node)
+    
+    # Add edges between consecutive nodes
+    for i in range(len(trace) - 1):
+        G.add_edge(trace[i], trace[i+1])
+    
+    return G
+
+def graph_to_trace(G: nx.DiGraph, start_node: Optional[int] = None) -> List[int]:
+    """Converts a graph into a trace by following edges from a start node.
+    
+    This function creates a trace by:
+    1. Starting at the specified node (or finding a suitable start)
+    2. Following outgoing edges until reaching a node with no outgoing edges
+    
+    Args:
+        G: NetworkX directed graph
+        start_node: Optional starting node. If None, uses the first node with no incoming edges
+        
+    Returns:
+        List of integers representing the sequence of nodes in the trace
+    """
+    if not G.nodes():
+        return []
+    
+    if start_node is None:
+        # Find nodes with no incoming edges
+        start_nodes = [n for n in G.nodes() if G.in_degree(n) == 0]
+        if not start_nodes:
+            # If no nodes have zero in-degree, use the first node
+            start_node = list(G.nodes())[0]
+        else:
+            start_node = start_nodes[0]
+    
+    trace = [start_node]
+    current = start_node
+    
+    while G.out_degree(current) > 0:
+        # Get the next node (assuming there's only one outgoing edge)
+        next_node = list(G.successors(current))[0]
+        trace.append(next_node)
+        current = next_node
+    
+    return trace
+
+def merge_graphs(graphs: List[nx.DiGraph]) -> nx.DiGraph:
+    """Merges multiple graphs into a single graph.
+    
+    This function combines multiple graphs by:
+    1. Adding all nodes from each graph
+    2. Adding all edges from each graph
+    3. Preserving the directed nature of the graphs
+    
+    Args:
+        graphs: List of NetworkX directed graphs
+        
+    Returns:
+        A single NetworkX directed graph containing all nodes and edges
+    """
+    merged = nx.DiGraph()
+    
+    for G in graphs:
+        # Add all nodes and edges from each graph
+        merged.add_nodes_from(G.nodes())
+        merged.add_edges_from(G.edges())
+    
+    return merged
+
+def get_graph_stats(G: nx.DiGraph) -> Dict[str, Any]:
+    """Returns statistics about the graph.
+    
+    This function computes various graph metrics including:
+    - Node and edge counts
+    - Directed/acyclic properties
+    - Node degrees
+    
+    Args:
+        G: NetworkX directed graph
+        
+    Returns:
+        Dictionary containing graph statistics including:
+        - num_nodes: Number of nodes
+        - num_edges: Number of edges
+        - is_directed: Whether the graph is directed
+        - is_dag: Whether the graph is a DAG
+        - has_cycles: Whether the graph contains cycles
+        - in_degrees: Dictionary of node in-degrees
+        - out_degrees: Dictionary of node out-degrees
+    """
+    return {
+        'num_nodes': G.number_of_nodes(),
+        'num_edges': G.number_of_edges(),
+        'is_directed': G.is_directed(),
+        'is_dag': nx.is_directed_acyclic_graph(G),
+        'has_cycles': not nx.is_directed_acyclic_graph(G),
+        'in_degrees': dict(G.in_degree()),
+        'out_degrees': dict(G.out_degree())
+    }
+
+def get_edge_labels() -> Dict[int, str]:
+    """Returns a mapping of edge IDs to their meanings in the test program.
+    
+    This function provides a mapping between edge IDs and their semantic meaning
+    in the test program, including:
+    - Entry points
+    - Path conditions
+    - Processing steps
+    - Output types
+    
+    Returns:
+        Dictionary mapping edge IDs to their semantic descriptions
+    """
+    return {
+        5: "Common entry point",
+        7: "Very negative path (< -10)",
+        8: "Slightly negative path (-10 to -1)",
+        9: "Zero path",
+        10: "Very positive path (> 10)",
+        11: "Slightly positive path (1 to 10)",
+        12: "Common processing",
+        13: "Common processing",
+        14: "Very negative output",
+        15: "Slightly negative output",
+        16: "Zero output",
+        17: "Common positive processing",
+        18: "Very positive output",
+        19: "Slightly positive output"
+    }
+
+def save_graph_visualization(G: nx.DiGraph, filename: str, output_dir: str = 'plots') -> None:
+    """Saves a visualization of the graph to a file.
+    
+    This function creates a visual representation of the graph including:
+    - Node layout using spring layout
+    - Edge arrows showing direction
+    - Node labels with edge meanings
+    - Graph statistics in the title
+    
+    Args:
+        G: NetworkX directed graph to visualize
+        filename: Name of the output file (without extension)
+        output_dir: Directory to save the plot in (default: 'plots')
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create figure with a larger size
+    plt.figure(figsize=(15, 10))
+    
+    # Use spring layout for better node positioning
+    pos = nx.spring_layout(G, k=1, iterations=50)
+    
+    # Draw nodes
+    nx.draw_networkx_nodes(G, pos, node_color='lightblue', 
+                          node_size=500, alpha=0.6)
+    
+    # Draw edges with arrows
+    nx.draw_networkx_edges(G, pos, edge_color='gray', 
+                          arrows=True, arrowsize=20)
+    
+    # Get edge labels
+    edge_labels = get_edge_labels()
+    
+    # Create node labels with edge meanings
+    node_labels = {node: f"{node}\n{edge_labels.get(node, '')}" 
+                  for node in G.nodes()}
+    
+    # Draw labels
+    nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=10)
+    
+    # Add title with graph statistics
+    stats = get_graph_stats(G)
+    plt.title(f'Graph Visualization\n'
+             f'Nodes: {stats["num_nodes"]}, Edges: {stats["num_edges"]}\n'
+             f'Is DAG: {stats["is_dag"]}, Has Cycles: {stats["has_cycles"]}')
+    
+    # Remove axis
+    plt.axis('off')
+    
+    # Save the plot
+    plt.savefig(os.path.join(output_dir, f'{filename}.png'), 
+                bbox_inches='tight', dpi=300)
+    plt.close() 
+--------------------------------------------------
+
+File: main.py
+Location: src/main.py
+Size: 4641 bytes
+Last Modified: 2025-06-10 18:45:44
+--------------------------------------------------
+
+#!/usr/bin/env python3
+
+import os
+from analysis import HybridTDAAnalyzer
+from visualization import create_all_figures
+from AFL_utils import AFL_Utils
+
+def setup_directories():
+    """Ensures all necessary directories exist for the analysis.
+    
+    Creates the following directories if they don't exist:
+    - figures: For storing visualization outputs
+    - test_programs: For storing programs to analyze
+    - test_inputs: For storing test input files
+    """
+    dirs = ['figures', 'test_programs', 'test_inputs']
+    for dir_name in dirs:
+        os.makedirs(dir_name, exist_ok=True)
+
+def run_analysis(program_path, input_files, generate_figures=True, show_plots=False):
+    """Runs the hybrid TDA analysis on the specified program and inputs.
+    
+    This function performs a complete analysis pipeline including:
+    1. Individual trace analysis using zigzag persistence
+    2. Global CFG analysis
+    3. Execution clustering analysis
+    4. Optional figure generation
+    
+    Args:
+        program_path (str): Path to the program to analyze
+        input_files (list, optional): List of input files to use for analysis.
+            If None, uses default test inputs. Defaults to None.
+        generate_figures (bool, optional): Whether to generate and save figures.
+            Defaults to True.
+        show_plots (bool, optional): Whether to display plots on screen.
+            Only used if generate_figures is True. Defaults to True.
+    
+    Returns:
+        HybridTDAAnalyzer: The analyzer object containing all analysis results
+    
+    Raises:
+        FileNotFoundError: If the program or input files are not found
+        ValueError: If no valid traces are found in any input files
+    """
+    print("=== Starting Hybrid TDA Analysis ===")
+    
+    # Check if program exists
+    if not os.path.exists(program_path):
+        raise FileNotFoundError(f"Program not found: {program_path}")
+    
+    # Initialize analyzer and AFL utilities
+    hybrid_analyzer = HybridTDAAnalyzer()
+    afl_utils = AFL_Utils(program_path)
+    
+    # If no input files specified, use default test inputs
+    
+
+    
+    # Step 1: Individual analysis for each trace
+    print("\nProcessing input files...")
+    valid_traces = 0
+    for input_file in input_files:
+        input_path = os.path.join('test_inputs', input_file)
+        if os.path.exists(input_path):
+            print(f"\nAnalyzing {input_file}...")
+            edges, nodes = afl_utils.run_showmap(input_path)
+            if edges:
+                hybrid_analyzer.analyze_execution_hybrid(edges, input_file)
+                valid_traces += 1
+            else:
+                print(f"Warning: No edges found in {input_file}")
+        else:
+            print(f"Warning: Input file {input_file} not found")
+    
+    if valid_traces == 0:
+        raise ValueError("No valid traces found in any input files")
+    
+    # Step 2: Complete global analysis
+    print("\nPerforming global analysis...")
+    global_diagrams = hybrid_analyzer.complete_global_analysis()
+    
+    # Step 3: Analyze clustering
+    print("\nAnalyzing execution clustering...")
+    hybrid_analyzer.analyze_execution_clustering()
+    
+    # Step 4: Generate figures if requested
+    if generate_figures:
+        print("\nGenerating figures...")
+        create_all_figures(hybrid_analyzer, program_path, show_plots)
+    
+    return hybrid_analyzer
+
+if __name__ == '__main__':
+    # Ensure directories exist
+    setup_directories()
+    input_files_loop_program = [
+            'zero_loop.txt', 'one_loop.txt', 'three_loop.txt', 
+            'seven_loop.txt', 'neg_five_loop.txt'
+        ] # these are the inputs for the loop_program
+    
+    input_files_test_program = [
+        'zero.txt', 'pos5.txt', 'pos20.txt', 
+        'neg5.txt', 'neg20.txt'
+    ] # these are the inputs for the test_program
+    
+    # Run analysis with default test program and inputs
+    program_path_loop_program = os.path.join('test_programs', 'loop_program')
+    program_path_test_program = os.path.join('test_programs', 'test_program')
+    
+    try:
+        hybrid_analyzer = run_analysis(program_path_loop_program, input_files=input_files_loop_program)
+        hybrid_analyzer = run_analysis(program_path_test_program, input_files=input_files_test_program)
+        print("\nAnalysis complete!")
+    except FileNotFoundError as e:
+        print(f"\nError: {e}")
+        print("Please make sure the test program exists and is compiled.")
+    except ValueError as e:
+        print(f"\nError: {e}")
+        print("Please check that the test inputs contain valid traces.")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}") 
+--------------------------------------------------
+
+File: visualization.py
+Location: src/visualization.py
+Size: 16375 bytes
+Last Modified: 2025-06-10 18:35:42
+--------------------------------------------------
+
+import networkx as nx
+import numpy as np
+import dionysus as d
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+from matplotlib.patches import FancyBboxPatch
+
+# Set up the plotting style
+plt.style.use('default')
+sns.set_palette("husl")
+
+def get_program_name(program_path):
+    """Extract program name from the full path.
+    
+    Args:
+        program_path (str): Full path to the program
+        
+    Returns:
+        str: Program name without path and extension
+    """
+    return os.path.splitext(os.path.basename(program_path))[0]
+
+def create_figure_1_global_cfg(global_analyzer, program_path, show_plots=True):
+    """
+    Figure 1: Global Control Flow Graph Structure
+    Shows the hierarchical branching with edge frequencies
+    
+    Args:
+        global_analyzer: The global analyzer containing CFG data
+        program_path (str): Path to the test program
+        show_plots (bool): Whether to display the plot. Defaults to True.
+    """
+    if not global_analyzer.global_cfg:
+        global_analyzer.build_global_cfg()
+        
+    # Create figure with more vertical space for titles
+    fig = plt.figure(figsize=(12, 10))
+    
+    # Create main axes with padding for title
+    ax = fig.add_subplot(111)
+    program_name = get_program_name(program_path)
+    ax.set_title(f'Global Control Flow Graph - {program_name}\n(Node colors indicate type, edge thickness shows frequency)', 
+                fontsize=14, weight='bold', pad=40)
+    
+    # Get root and distances
+    root = global_analyzer.all_traces[0][0]
+    distances = nx.shortest_path_length(global_analyzer.global_cfg, source=root)
+    
+    # Group nodes by distance for layout
+    levels = {}
+    for node, dist in distances.items():
+        if dist not in levels:
+            levels[dist] = []
+        levels[dist].append(node)
+    
+    # Create positions
+    pos = {}
+    for level, nodes in levels.items():
+        for i, node in enumerate(sorted(nodes)):
+            # Spread nodes horizontally within each level
+            x_offset = (i - len(nodes)/2) * 1.5
+            pos[node] = (level * 3, x_offset)
+    
+    # Draw nodes with colors based on their role
+    node_colors = []
+    node_sizes = []
+    for node in global_analyzer.global_cfg.nodes():
+        out_degree = global_analyzer.global_cfg.out_degree(node)
+        in_degree = global_analyzer.global_cfg.in_degree(node)
+        
+        if out_degree > 1:  # Branch point
+            node_colors.append('lightcoral')
+            node_sizes.append(1200)
+        elif in_degree > 1:  # Convergence point
+            node_colors.append('lightgreen')  
+            node_sizes.append(1200)
+        else:  # Regular node
+            node_colors.append('lightblue')
+            node_sizes.append(800)
+    
+    nx.draw_networkx_nodes(global_analyzer.global_cfg, pos, node_color=node_colors, 
+                          node_size=node_sizes, alpha=0.8, ax=ax)
+    
+    # Draw edges with thickness based on frequency
+    edges = list(global_analyzer.global_cfg.edges(data=True))
+    max_freq = max([data['frequency'] for _, _, data in edges]) if edges else 1
+    
+    for u, v, data in edges:
+        freq = data['frequency']
+        width = 1 + 4 * (freq / max_freq)  # Scale width 1-5
+        alpha = 0.6 + 0.4 * (freq / max_freq)  # Higher frequency = more opaque
+        nx.draw_networkx_edges(global_analyzer.global_cfg, pos, [(u, v)], width=width, 
+                             alpha=alpha, edge_color='gray', ax=ax)
+    
+    # Add labels
+    nx.draw_networkx_labels(global_analyzer.global_cfg, pos, font_size=12, font_weight='bold', ax=ax)
+    
+    # Add edge frequency labels
+    edge_labels = {(u, v): str(data['frequency']) 
+                  for u, v, data in global_analyzer.global_cfg.edges(data=True) if data['frequency'] > 1}
+    nx.draw_networkx_edge_labels(global_analyzer.global_cfg, pos, edge_labels, font_size=10, 
+                                font_color='red', ax=ax)
+    
+    # Add legend
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightcoral', 
+                  markersize=12, label='Branch Points'),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgreen', 
+                  markersize=12, label='Convergence Points'),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightblue', 
+                  markersize=10, label='Regular Nodes')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right')
+    
+    # Add distance labels
+    ax.axis('off')
+    
+    plt.savefig(f'figures/{program_name}_global_cfg_structure.png', dpi=300, bbox_inches='tight')
+    if show_plots:
+        plt.show()
+    plt.close()
+
+def create_figure_2_persistence_diagram(global_analyzer, program_path, show_plots=True):
+    """
+    Figure 2: Global CFG Barcode Plot
+    Shows the barcodes for H0 and H1 features
+    
+    Args:
+        global_analyzer: The global analyzer containing CFG data
+        program_path (str): Path to the test program
+        show_plots (bool): Whether to display the plot. Defaults to True.
+    """
+    if not global_analyzer.global_cfg:
+        global_analyzer.build_global_cfg()
+    diagrams = global_analyzer.analyze_global_persistence()
+    
+    # Create figure with more vertical space for titles
+    fig = plt.figure(figsize=(12, 8))
+    program_name = get_program_name(program_path)
+    fig.suptitle(f'Global CFG Barcodes - {program_name}', fontsize=16, fontweight='bold', y=1)
+    
+    # Create subplots with more space between them
+    gs = plt.GridSpec(1, 2, figure=fig, wspace=0.3)
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax1 = fig.add_subplot(gs[0, 1])
+    
+    # H0
+    if diagrams and len(diagrams) > 0 and diagrams[0]:
+        d.plot.plot_bars(diagrams[0], ax=ax0)
+        ax0.set_title('H₀ Barcode', pad=20)
+    else:
+        ax0.set_title('H₀ Barcode (None)', pad=20)
+    
+    # H1
+    if diagrams and len(diagrams) > 1 and diagrams[1]:
+        d.plot.plot_bars(diagrams[1], ax=ax1, color='red')
+        ax1.set_title('H₁ Barcode', pad=20)
+    else:
+        ax1.set_title('H₁ Barcode (None)', pad=20)
+    
+    ax0.set_xlabel('Filtration Value')
+    ax1.set_xlabel('Filtration Value')
+    
+    plt.savefig(f'figures/{program_name}_global_cfg_barcode.png', dpi=300, bbox_inches='tight')
+    if show_plots:
+        plt.show()
+    plt.close()
+
+def create_figure_3_execution_signatures(hybrid_analyzer, program_path, show_plots=True):
+    """Creates a figure showing execution signatures and clustering analysis.
+    
+    This figure consists of two subplots:
+    1. Left: Bar chart comparing topological signatures across executions
+    2. Right: Similarity matrix showing pairwise execution similarities
+    
+    Args:
+        hybrid_analyzer (HybridTDAAnalyzer): The analyzer containing execution data
+        program_path (str): Path to the test program
+        show_plots (bool): Whether to display the plot. Defaults to True.
+    
+    The figure is saved with the program name in the filename
+    """
+    # Create figure with more vertical space for titles
+    fig = plt.figure(figsize=(20, 14))
+    program_name = get_program_name(program_path)
+    fig.suptitle(f'Execution Signatures and Clustering - {program_name}', 
+                fontsize=16, fontweight='bold', y=0.95)
+    
+    # Create subplots with more space between them
+    gs = plt.GridSpec(1, 2, figure=fig, wspace=0.3)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    
+    # Get execution data
+    executions = []
+    branch_points = []
+    convergence_points = []
+    complexity = []
+    
+    for input_name, data in hybrid_analyzer.hybrid_signatures.items():
+        if 'combined_signature' in data:
+            sig = data['combined_signature']
+            executions.append(input_name)
+            branch_points.append(sig['global_branch_points'])
+            convergence_points.append(sig['global_convergence_points'])
+            complexity.append(sig['total_topological_complexity'])
+    
+    # Left plot: Signature comparison
+    x = np.arange(len(executions))
+    width = 0.25
+    
+    bars1 = ax1.bar(x - width, branch_points, width, label='Branch Points', 
+                   color='lightcoral', alpha=0.8)
+    bars2 = ax1.bar(x, convergence_points, width, label='Convergence Points', 
+                   color='lightgreen', alpha=0.8)
+    bars3 = ax1.bar(x + width, complexity, width, label='Total Complexity', 
+                   color='gold', alpha=0.8)
+    
+    ax1.set_xlabel('Execution')
+    ax1.set_ylabel('Count')
+    ax1.set_title('Topological Signature Comparison', pad=20)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(executions, rotation=45)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2, bars3]:
+        for bar in bars:
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                    f'{int(height)}', ha='center', va='bottom')
+    
+    # Right plot: Similarity matrix
+    n = len(executions)
+    similarity_matrix = np.zeros((n, n))
+    
+    # Compute pairwise similarities
+    for i, (name1, sig1) in enumerate(zip(executions, hybrid_analyzer.hybrid_signatures.values())):
+        for j, (name2, sig2) in enumerate(zip(executions, hybrid_analyzer.hybrid_signatures.values())):
+            if i <= j:
+                similarity = hybrid_analyzer.compute_hybrid_similarity(
+                    sig1['combined_signature'], 
+                    sig2['combined_signature']
+                )
+                similarity_matrix[i, j] = similarity
+                similarity_matrix[j, i] = similarity
+    
+    im = ax2.imshow(similarity_matrix, cmap='RdYlBu_r', vmin=0.9, vmax=1.0)
+    
+    # Add text annotations
+    for i in range(n):
+        for j in range(n):
+            ax2.text(j, i, f'{similarity_matrix[i, j]:.3f}',
+                          ha="center", va="center", color="black", fontweight='bold')
+    
+    ax2.set_xticks(range(n))
+    ax2.set_yticks(range(n))
+    ax2.set_xticklabels(executions, rotation=45)
+    ax2.set_yticklabels(executions)
+    ax2.set_title('Topological Similarity Matrix\n(Higher values = more similar)', pad=20)
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+    cbar.set_label('Similarity Score')
+    
+    plt.savefig(f'figures/{program_name}_execution_signatures.png', dpi=300, bbox_inches='tight')
+    if show_plots:
+        plt.show()
+    plt.close()
+
+def create_figure_4_hybrid_approach(hybrid_analyzer, program_path, show_plots=True):
+    """Creates a figure illustrating the hybrid analysis approach.
+    
+    This figure consists of four subplots:
+    1. Top left: Individual trace graph (zigzag analysis input)
+    2. Top right: Individual barcodes (H0, H1)
+    3. Bottom left: Global CFG structure
+    4. Bottom right: Global barcodes
+    
+    Args:
+        hybrid_analyzer (HybridTDAAnalyzer): The analyzer containing analysis data
+        program_path (str): Path to the test program
+        show_plots (bool): Whether to display the plot. Defaults to True.
+    
+    The figure is saved with the program name in the filename
+    """
+    import dionysus as d
+    import matplotlib.pyplot as plt
+    
+    # Create figure with more vertical space for titles
+    fig = plt.figure(figsize=(20, 14))
+    program_name = get_program_name(program_path)
+    fig.suptitle(f'Hybrid Approach - {program_name}', fontsize=16, fontweight='bold', y=0.95)
+    
+    # Create subplots with more space between them
+    gs = plt.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    # Top left: Individual trace (zigzag input)
+    first_trace = list(hybrid_analyzer.hybrid_signatures.values())[0]['trace']
+    individual_analyzer = hybrid_analyzer.individual_analyzer
+    individual_analyzer.analyze_trace(first_trace)
+    G_individual = individual_analyzer.G
+    pos_individual = nx.spring_layout(G_individual)
+    nx.draw(G_individual, pos_individual, ax=ax1, with_labels=True,
+           node_color='lightblue', node_size=800, font_size=12)
+    ax1.set_title('Individual Trace\n(Zigzag Analysis Input)', fontweight='bold', pad=20)
+    
+    # Top right: Individual barcodes (H0, H1)
+    if individual_analyzer.diagrams:
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax2)
+        ax2_h0 = ax2
+        ax2_h1 = divider.append_axes('right', size='100%', pad=0.1, sharey=ax2)
+        if individual_analyzer.diagrams[0]:
+            d.plot.plot_bars(individual_analyzer.diagrams[0], ax=ax2_h0)
+            ax2_h0.set_title('H₀ Barcode', pad=20)
+        else:
+            ax2_h0.set_title('H₀ Barcode (None)', pad=20)
+        if len(individual_analyzer.diagrams) > 1 and individual_analyzer.diagrams[1]:
+            d.plot.plot_bars(individual_analyzer.diagrams[1], ax=ax2_h1, color='red')
+            ax2_h1.set_title('H₁ Barcode', pad=20)
+        else:
+            ax2_h1.set_title('H₁ Barcode (None)', pad=20)
+        ax2_h0.set_xlabel('Filtration Value')
+        ax2_h1.set_xlabel('Filtration Value')
+        ax2_h1.get_yaxis().set_visible(False)
+    else:
+        ax2.set_title('No barcodes', pad=20)
+    
+    # Bottom left: Global CFG structure
+    G_global = hybrid_analyzer.global_analyzer.global_cfg
+    if not G_global:
+        hybrid_analyzer.global_analyzer.build_global_cfg()
+        G_global = hybrid_analyzer.global_analyzer.global_cfg
+    pos_global = nx.spring_layout(G_global)
+    nx.draw(G_global, pos_global, ax=ax3, with_labels=True,
+           node_color='lightgreen', node_size=800, font_size=12,
+           arrows=True, arrowsize=20)
+    ax3.set_title('Global CFG\n(Multiple Traces Combined)', fontweight='bold', pad=20)
+    
+    # Bottom right: Global barcodes (H0, H1)
+    global_diagrams = hybrid_analyzer.global_analyzer.analyze_global_persistence()
+    if global_diagrams:
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax4)
+        ax4_h0 = ax4
+        ax4_h1 = divider.append_axes('right', size='100%', pad=0.1, sharey=ax4)
+        if global_diagrams[0]:
+            d.plot.plot_bars(global_diagrams[0], ax=ax4_h0)
+            ax4_h0.set_title('H₀ Barcode', pad=20)
+        else:
+            ax4_h0.set_title('H₀ Barcode (None)', pad=20)
+        if len(global_diagrams) > 1 and global_diagrams[1]:
+            d.plot.plot_bars(global_diagrams[1], ax=ax4_h1, color='red')
+            ax4_h1.set_title('H₁ Barcode', pad=20)
+        else:
+            ax4_h1.set_title('H₁ Barcode (None)', pad=20)
+        ax4_h0.set_xlabel('Filtration Value')
+        ax4_h1.set_xlabel('Filtration Value')
+        ax4_h1.get_yaxis().set_visible(False)
+    else:
+        ax4.set_title('No barcodes', pad=20)
+    
+    plt.savefig(f'figures/{program_name}_hybrid_approach.png', dpi=300, bbox_inches='tight')
+    if show_plots:
+        plt.show()
+    plt.close()
+
+def create_all_figures(hybrid_analyzer, program_path, show_plots=True):
+    """Generate all figures for the analysis using actual data.
+    
+    This function creates and saves all visualization figures:
+    1. Global CFG structure
+    2. Persistence diagrams
+    3. Execution signatures and clustering
+    4. Hybrid approach visualization
+    
+    Args:
+        hybrid_analyzer (HybridTDAAnalyzer): The analyzer containing all analysis results
+        program_path (str): Path to the test program
+        show_plots (bool): Whether to display the plots. Defaults to True.
+    """
+    # Create figures directory if it doesn't exist
+    os.makedirs('figures', exist_ok=True)
+    
+    print("Generating Figure 1: Global CFG Structure...")
+    create_figure_1_global_cfg(hybrid_analyzer.global_analyzer, program_path, show_plots)
+    
+    print("Generating Figure 2: Persistence Diagram...")
+    create_figure_2_persistence_diagram(hybrid_analyzer.global_analyzer, program_path, show_plots)
+    
+    print("Generating Figure 3: Execution Signatures...")
+    create_figure_3_execution_signatures(hybrid_analyzer, program_path, show_plots)
+    
+    print("Generating Figure 4: Hybrid Approach...")
+    create_figure_4_hybrid_approach(hybrid_analyzer, program_path, show_plots)
+    
+    print("All figures generated successfully!") 
+--------------------------------------------------
+
